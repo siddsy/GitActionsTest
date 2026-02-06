@@ -1,23 +1,33 @@
-name: Hourly email test
+name: Hourly AgOnline scrape + email
 
 on:
   schedule:
-    - cron: "0 * * * *"
+    - cron: "0 * * * *"   # every hour (UTC)
   workflow_dispatch:
 
 jobs:
-  send-email:
+  run:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Run script
+      - name: Install Python + Playwright deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas openpyxl playwright
+          playwright install --with-deps chromium
+
+      - name: Run scraper and send mail
         env:
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+          EMAIL_TO: dunderhenlin@gmail.com
         run: python send_mail.py
