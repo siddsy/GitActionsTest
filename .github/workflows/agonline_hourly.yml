@@ -1,4 +1,4 @@
-name: AgOnline extraction + email (test)
+name: AgOnline extraction + email (debug-safe)
 
 on:
   workflow_dispatch:
@@ -6,13 +6,13 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Debug (prove file is present)
+      - name: Show repo contents
         run: |
           pwd
           ls -la
@@ -28,10 +28,17 @@ jobs:
           pip install playwright
           python -m playwright install --with-deps chromium
 
-      - name: Run send_mail.py (repo root)
+      - name: Run extraction + email
         env:
           CI: "1"
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
         run: |
           python send_mail.py
+
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug
+          path: debug/
