@@ -25,19 +25,10 @@ jobs:
           pip install pandas openpyxl playwright
           playwright install --with-deps chromium
 
-      - name: Run scraper + email
+      - name: Run scraper (emails CSV in-memory)
         env:
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: |
           python send_mail.py
-
-      - name: Upload output artifact (backup)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: agonline-output
-          path: |
-            master-Raw.xlsx
-          if-no-files-found: warn
