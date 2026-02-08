@@ -79,10 +79,8 @@ def extract_xhr_payload() -> dict:
             page.goto(URL, wait_until="domcontentloaded", timeout=90000)
             page.wait_for_timeout(4000)
 
-            # Wait for iframe to EXIST (not visible)
             page.wait_for_selector("iframe", state="attached", timeout=90000)
 
-            # Find Power BI frame by URL
             powerbi_frame = None
             for _ in range(90):
                 for frame in page.frames:
@@ -100,7 +98,6 @@ def extract_xhr_payload() -> dict:
 
             powerbi_frame.wait_for_selector(".pivotTableCellNoWrap", timeout=90000)
 
-            # Reset visual state
             date_header = powerbi_frame.get_by_role("columnheader", name="Date")
             date_header.click()
             powerbi_frame.wait_for_timeout(WAIT_AFTER_SORT_MS)
@@ -154,4 +151,42 @@ def send_email(payload: dict):
     stamp = payload.get("utc_timestamp")
     count = payload.get("captured_count", 0)
 
-    filename = f"sale_{safe_name(s
+    filename = f"sale_{safe_name(str(sale_no))}_{stamp}.json"
+    data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+
+    msg = EmailMessage()
+    msg["Subject"] = f"AgOnline extraction test – {sale_no} ({count} XHR)"
+    msg["From"] = email_from
+    msg["To"] = TO_EMAIL
+    msg.set_content(
+        "GitHub Actions extraction run.\n\n"
+        f"Sale: {sale_no}\n"
+        f"Captured XHR: {count}\n"
+        f"UTC: {stamp}\n\n"
+        "JSON payload attached."
+    )
+
+    msg.add_attachment(
+        data,
+        maintype="application",
+        subtype="json",
+        filename=filename,
+    )
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+        server.starttls()
+        server.login(email_from, email_pass)
+        server.send_message(msg)
+
+    print("Email sent successfully")
+
+
+# ---------------- MAIN ----------------
+def main():
+    payload = extract_xhr_payload()
+    print("Captured:", payload["captured_count"])
+    send_email(payload)
+
+
+if __name__ == "__main__":
+    main()
