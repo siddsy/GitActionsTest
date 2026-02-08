@@ -1,10 +1,18 @@
 # ==========================================
-# AgOnline PowerBI → XLSX (3 sheets) + EMAIL (GitHub Actions safe)
-# - 3 clicks: Date header twice + first sale click
-# - Captures PowerBI JSON payloads
-# - Reconstructs rows
-# - Writes XLSX with sheets: sales, summary_rows, breakdown_rows
-# - Emails the XLSX (uses EMAIL_FROM / EMAIL_PASS secrets)
+# AgOnline PowerBI → master.xlsx (3 sheets) + watermark state.json + email
+#
+# Behavior:
+# - Reads state.json: {"last_sale_uid": "..."} (or empty first run)
+# - Sort Date twice
+# - Walks newest → older sales until it hits last_sale_uid
+# - For each new sale: capture payloads, reconstruct rows, append to master.xlsx
+# - On success: update state.json to newest sale uid, commit+push master.xlsx + state.json
+# - Email master.xlsx only if new sales were processed
+#
+# Sheets:
+# - sales
+# - summary_rows
+# - breakdown_rows
 # ==========================================
 
 import asyncio
@@ -12,6 +20,7 @@ import json
 import os
 import re
 import smtplib
+import subprocess
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
@@ -24,17 +33,18 @@ URL = "https://www.agonline.co.nz/saleyard-results"
 
 WAIT_AFTER_SORT_MS = 1200
 WAIT_AFTER_CLICK_MS = 6500
-MIN_XHR_EXPECTED = 3
 
-# In Actions: headless must be True
+# "new sale click should trigger at least a few payloads"
+MIN_PAYLOADS_EXPECTED = 3
+
 HEADLESS = os.getenv("CI", "").lower() in ("1", "true", "yes")
 
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
 TO_EMAIL = "dunderhenlin@gmail.com"
 
-OUT_DIR = Path("output")
-OUT_DIR.mkdir(exist_ok=True)
+STATE_PATH = Path("state.json")
+MASTER_XLSX = Path("master.xlsx")
 
 DEBUG_DIR = Path("debug")
 DEBUG_DIR.mkdir(exist_ok=True)
@@ -144,7 +154,6 @@ def build_maps(descriptor):
         nm = (s.get("Name", "") or "")
         lnm = nm.lower()
 
-        # dimensions
         if kind == 1 and isinstance(val, str) and val.startswith("G"):
             if "section" in lnm and "description" in lnm:
                 dim_map[val] = "section"
@@ -155,7 +164,6 @@ def build_maps(descriptor):
             else:
                 dim_map[val] = f"dim_{val}"
 
-        # measures (+ subtotal aliases)
         if kind == 2 and isinstance(val, str) and val.startswith("M"):
             m = norm_measure(nm)
             if m:
@@ -164,7 +172,6 @@ def build_maps(descriptor):
                     if isinstance(a, str) and a.startswith("A"):
                         meas_map[a] = m
 
-    # subtotal members
     subtotal_members = set()
     groupings = safe_get(descriptor, ["Expressions", "Primary", "Groupings"], []) or []
     for g in groupings:
@@ -339,7 +346,6 @@ def extract_rows_from_payload(payload, sale_meta, payload_idx, debug_list):
     return out_rows
 
 
-# -------- TITLE PICKER (avoids placeholder) --------
 def collect_candidate_titles(payloads):
     out = []
     for p in payloads:
@@ -394,26 +400,20 @@ def pick_best_title(payloads):
             return -10**9
         if t in ("loading", "please wait"):
             return -10**9
-
         sc = 0
         if "sale no" in t:
             sc += 100
         if "report for" in t:
             sc += 80
-        if "pgg" in t:
-            sc += 60
-        if "market report" in t:
-            sc += 40
         if re.search(r"\d{1,2}/\d{1,2}/\d{2,4}", t):
             sc += 30
         sc += min(len(t), 120)
         return sc
 
     if not uniq:
-        return None, None, None, None, []
+        return None, None, None, None
 
     best = max(uniq, key=score)
-
     sale_match = re.search(r"Sale\s*No\s*[:#]?\s*(\d+)", best, flags=re.IGNORECASE)
     date_match = re.search(r"(\d{1,2}/\d{1,2}/\d{2,4})", best)
     saleyard = None
@@ -426,21 +426,154 @@ def pick_best_title(payloads):
         date_match.group(1) if date_match else None,
         saleyard,
         sale_match.group(1) if sale_match else None,
-        uniq
     )
 
 
-# ---------------- PLAYWRIGHT CAPTURE ----------------
-async def capture_powerbi_payloads() -> tuple[list[dict], str]:
-    captured_payloads = []
-    sale_ui = None
+def read_state():
+    if not STATE_PATH.exists():
+        return {"last_sale_uid": None}
+    try:
+        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {"last_sale_uid": None}
+
+
+def write_state(last_sale_uid: str):
+    STATE_PATH.write_text(json.dumps({"last_sale_uid": last_sale_uid}, indent=2), encoding="utf-8")
+
+
+def sale_uid(sale_no: str, sale_date: str | None, saleyard: str | None):
+    return f"{sale_no}|{sale_date or ''}|{saleyard or ''}"
+
+
+def load_existing_master():
+    if not MASTER_XLSX.exists():
+        return (
+            pd.DataFrame(columns=["sale_no", "sale_key", "capture_id", "sale_date", "saleyard", "raw_title"]),
+            pd.DataFrame(columns=KEYS + MEASURES + ["price_domain_conflict"]),
+            pd.DataFrame(columns=KEYS + MEASURES + ["price_domain_conflict"]),
+        )
+
+    sales = pd.read_excel(MASTER_XLSX, sheet_name="sales")
+    summary = pd.read_excel(MASTER_XLSX, sheet_name="summary_rows")
+    breakdown = pd.read_excel(MASTER_XLSX, sheet_name="breakdown_rows")
+    return sales, summary, breakdown
+
+
+def write_master(sales_df, summary_df, breakdown_df):
+    with pd.ExcelWriter(MASTER_XLSX, engine="openpyxl") as writer:
+        sales_df.to_excel(writer, index=False, sheet_name="sales")
+        summary_df.to_excel(writer, index=False, sheet_name="summary_rows")
+        breakdown_df.to_excel(writer, index=False, sheet_name="breakdown_rows")
+
+
+def git_commit_and_push(msg: str):
+    # Only do this inside Actions (so local runs don't push)
+    if os.getenv("GITHUB_ACTIONS", "").lower() != "true":
+        print("Not in GitHub Actions; skipping git push.")
+        return
+
+    subprocess.run(["git", "add", str(STATE_PATH), str(MASTER_XLSX)], check=True)
+
+    status = subprocess.check_output(["git", "status", "--porcelain"], text=True).strip()
+    if not status:
+        print("No git changes to commit.")
+        return
+
+    subprocess.run(["git", "commit", "-m", msg], check=True)
+    subprocess.run(["git", "push"], check=True)
+    print("Pushed updated master.xlsx + state.json")
+
+
+def email_master():
+    email_from = os.environ["EMAIL_FROM"]
+    email_pass = os.environ["EMAIL_PASS"]
+
+    msg = EmailMessage()
+    msg["Subject"] = f"AgOnline master.xlsx updated – {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+    msg["From"] = email_from
+    msg["To"] = TO_EMAIL
+    msg.set_content("Attached: updated master.xlsx (sales, summary_rows, breakdown_rows).")
+
+    msg.add_attachment(
+        MASTER_XLSX.read_bytes(),
+        maintype="application",
+        subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=MASTER_XLSX.name,
+    )
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
+        server.login(email_from, email_pass)
+        server.send_message(msg)
+
+    print("Email sent to:", TO_EMAIL)
+
+
+def looks_like_sale_no(text: str) -> bool:
+    # Adjust if your sale numbers can include letters
+    t = (text or "").strip()
+    return bool(re.fullmatch(r"\d{3,8}", t))
+
+
+# ---------------- PLAYWRIGHT ----------------
+async def capture_for_sale(powerbi_frame, sale_no_text: str) -> list[dict]:
+    payloads: list[dict] = []
+
+    async def on_response(resp):
+        try:
+            if resp.request.resource_type not in ("xhr", "fetch"):
+                return
+            ct = (resp.headers.get("content-type") or "").lower()
+            if "application/json" not in ct:
+                return
+            body = await resp.json()
+            if not (
+                isinstance(body, dict)
+                and isinstance(body.get("results"), list)
+                and body["results"]
+                and isinstance(safe_get(body, ["results", 0, "result", "data"]), dict)
+            ):
+                return
+            payloads.append(body)
+        except Exception:
+            pass
+
+    page = powerbi_frame.page
+    page.on("response", on_response)
+
+    try:
+        payloads.clear()
+
+        # Click the cell that matches this sale number
+        cell = powerbi_frame.locator(".pivotTableCellNoWrap").filter(has_text=sale_no_text).first
+        await cell.click()
+        await powerbi_frame.wait_for_timeout(WAIT_AFTER_CLICK_MS)
+
+        return payloads[:]
+    finally:
+        try:
+            page.remove_listener("response", on_response)
+        except Exception:
+            pass
+
+
+async def run():
+    state = read_state()
+    old_watermark = state.get("last_sale_uid")
+
+    processed_sale_uids: list[str] = []
+    new_watermark = None
+
+    existing_sales, existing_summary, existing_breakdown = load_existing_master()
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=HEADLESS,
             args=["--no-sandbox", "--disable-dev-shm-usage"] if HEADLESS else None,
         )
-
         context = await browser.new_context(
             viewport={"width": 1366, "height": 900},
             user_agent=(
@@ -449,38 +582,13 @@ async def capture_powerbi_payloads() -> tuple[list[dict], str]:
             ),
             locale="en-NZ",
         )
-
         page = await context.new_page()
-
-        async def on_response(resp):
-            try:
-                if resp.request.resource_type not in ("xhr", "fetch"):
-                    return
-                ct = (resp.headers.get("content-type") or "").lower()
-                if "application/json" not in ct:
-                    return
-                body = await resp.json()
-                if not (
-                    isinstance(body, dict)
-                    and isinstance(body.get("results"), list)
-                    and body["results"]
-                    and isinstance(safe_get(body, ["results", 0, "result", "data"]), dict)
-                ):
-                    return
-                captured_payloads.append(body)
-            except Exception:
-                pass
-
-        page.on("response", on_response)
 
         try:
             await page.goto(URL, wait_until="domcontentloaded", timeout=90000)
             await page.wait_for_timeout(4000)
-
-            # Wait for iframe to exist
             await page.wait_for_selector("iframe", state="attached", timeout=90000)
 
-            # Find PowerBI frame
             powerbi_frame = None
             for _ in range(90):
                 for fr in page.frames:
@@ -494,22 +602,170 @@ async def capture_powerbi_payloads() -> tuple[list[dict], str]:
             if not powerbi_frame:
                 await page.screenshot(path=str(DEBUG_DIR / "no_powerbi_frame.png"), full_page=True)
                 (DEBUG_DIR / "no_powerbi_frame.html").write_text(await page.content(), encoding="utf-8")
-                raise RuntimeError("Power BI iframe not found in CI")
+                raise RuntimeError("Power BI iframe not found")
 
             await powerbi_frame.wait_for_selector(".pivotTableCellNoWrap", timeout=90000)
 
-            # 1) Click Date twice
+            # Reset state: Date sort twice
             date_header = powerbi_frame.get_by_role("columnheader", name="Date")
             await date_header.click()
             await powerbi_frame.wait_for_timeout(WAIT_AFTER_SORT_MS)
             await date_header.click()
             await powerbi_frame.wait_for_timeout(WAIT_AFTER_SORT_MS)
 
-            # 2) Click first sale
-            first_sale = powerbi_frame.locator(".pivotTableCellNoWrap").first
-            sale_ui = (await first_sale.inner_text()).strip()
-            await first_sale.click()
-            await powerbi_frame.wait_for_timeout(WAIT_AFTER_CLICK_MS)
+            # Grab visible sale numbers (top chunk)
+            texts = await powerbi_frame.locator(".pivotTableCellNoWrap").all_inner_texts()
+            sale_nos = []
+            for t in texts:
+                tt = (t or "").strip()
+                if looks_like_sale_no(tt):
+                    sale_nos.append(tt)
+
+            # de-dupe preserve order
+            seen = set()
+            sale_nos_uniq = []
+            for s in sale_nos:
+                if s not in seen:
+                    seen.add(s)
+                    sale_nos_uniq.append(s)
+
+            if not sale_nos_uniq:
+                await page.screenshot(path=str(DEBUG_DIR / "no_sales_found.png"), full_page=True)
+                (DEBUG_DIR / "no_sales_found.html").write_text(await page.content(), encoding="utf-8")
+                raise RuntimeError("No sale numbers found in visible table cells")
+
+            newest_sale_no = sale_nos_uniq[0]
+            print("Newest visible sale:", newest_sale_no)
+
+            # We only set watermark after we successfully process at least the first sale
+            # (but we store it as "candidate" now)
+            candidate_new_watermark_sale_no = newest_sale_no
+
+            new_sales_rows = []
+            new_summary_rows = []
+            new_breakdown_rows = []
+
+            # Loop sales until we hit old watermark
+            for idx, sale_no_text in enumerate(sale_nos_uniq):
+                # Capture payloads for this sale
+                payloads = await capture_for_sale(powerbi_frame, sale_no_text)
+
+                if len(payloads) < MIN_PAYLOADS_EXPECTED:
+                    print(f"Skipping sale {sale_no_text}: low payloads ({len(payloads)})")
+                    continue
+
+                raw_title, sale_date, saleyard, parsed_sale_no = pick_best_title(payloads)
+
+                # Sale meta
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                sale_no_final = parsed_sale_no or sale_no_text
+                s_uid = sale_uid(sale_no_final, sale_date, saleyard)
+
+                # stop condition: if we've reached the previously processed watermark
+                if old_watermark and s_uid == old_watermark:
+                    print("Reached old watermark. Stopping:", old_watermark)
+                    break
+
+                # Build rows for this sale
+                sale_meta = {
+                    "sale_no": sale_no_final,
+                    "sale_key": f"{sale_no_text}_{stamp}",
+                    "capture_id": stamp,
+                    "sale_date": sale_date,
+                    "saleyard": saleyard,
+                    "raw_title": raw_title,
+                }
+
+                debug_skips = []
+                all_rows = []
+                for i, pl in enumerate(payloads):
+                    all_rows.extend(extract_rows_from_payload(pl, sale_meta, i, debug_skips))
+
+                df_rows = pd.DataFrame(all_rows)
+                if df_rows.empty:
+                    print(f"Skipping sale {sale_no_final}: no reconstructed rows")
+                    continue
+
+                for k in KEYS:
+                    if k not in df_rows.columns:
+                        df_rows[k] = None
+                for m in MEASURES:
+                    if m not in df_rows.columns:
+                        df_rows[m] = None
+
+                df_rows["price_domain_conflict"] = df_rows[KG_COLS].notna().any(axis=1) & df_rows[HD_COLS].notna().any(axis=1)
+
+                def first_non_null(series):
+                    for v in series:
+                        if pd.notna(v):
+                            return v
+                    return None
+
+                df_master = (
+                    df_rows.drop_duplicates()
+                    .groupby(KEYS, dropna=False)[MEASURES + ["price_domain_conflict"]]
+                    .agg(first_non_null)
+                    .reset_index()
+                )
+
+                df_summary = df_master[df_master["table_type"] == "summary"].copy()
+                df_breakdown = df_master[df_master["table_type"] == "breakdown"].copy()
+
+                new_sales_rows.append(sale_meta)
+                new_summary_rows.append(df_summary)
+                new_breakdown_rows.append(df_breakdown)
+                processed_sale_uids.append(s_uid)
+
+                print(f"Processed sale {sale_no_final} uid={s_uid} "
+                      f"(summary={len(df_summary)}, breakdown={len(df_breakdown)})")
+
+                # After first successful sale, set the new watermark
+                if new_watermark is None:
+                    # Use the parsed/meta values if available
+                    new_watermark = s_uid
+
+            # If nothing new, exit cleanly (no email, no commit)
+            if not processed_sale_uids:
+                print("No new sales found. Nothing to update.")
+                await browser.close()
+                return
+
+            # Merge into existing master
+            new_sales_df = pd.DataFrame(new_sales_rows)
+            new_summary_df = pd.concat([d for d in new_summary_rows if not d.empty], ignore_index=True) if new_summary_rows else pd.DataFrame()
+            new_breakdown_df = pd.concat([d for d in new_breakdown_rows if not d.empty], ignore_index=True) if new_breakdown_rows else pd.DataFrame()
+
+            sales_df = pd.concat([existing_sales, new_sales_df], ignore_index=True)
+            sales_df = sales_df.drop_duplicates(subset=["sale_no", "sale_date", "saleyard"], keep="last")
+
+            summary_df = pd.concat([existing_summary, new_summary_df], ignore_index=True) if not new_summary_df.empty else existing_summary
+            breakdown_df = pd.concat([existing_breakdown, new_breakdown_df], ignore_index=True) if not new_breakdown_df.empty else existing_breakdown
+
+            # De-dupe on the KEYS
+            if not summary_df.empty:
+                summary_df = summary_df.drop_duplicates(subset=KEYS, keep="last")
+                summary_df = summary_df.sort_values(["sale_date", "sale_no", "section", "row_level", "class"], na_position="last")
+
+            if not breakdown_df.empty:
+                breakdown_df = breakdown_df.drop_duplicates(subset=KEYS, keep="last")
+                breakdown_df = breakdown_df.sort_values(
+                    ["sale_date", "sale_no", "class", "row_level", "weight_from", "weight_to", "weight_range"],
+                    na_position="last"
+                )
+
+            write_master(sales_df, summary_df, breakdown_df)
+
+            # Update watermark ONLY after successful write
+            # If we somehow didn't set it (shouldn't happen), fall back to first processed
+            final_watermark = new_watermark or processed_sale_uids[0]
+            write_state(final_watermark)
+
+            # Commit + push updated files
+            msg = f"Update master.xlsx (+{len(processed_sale_uids)} sales), watermark={final_watermark}"
+            git_commit_and_push(msg)
+
+            # Email the updated master
+            email_master()
 
         except Exception:
             try:
@@ -520,132 +776,6 @@ async def capture_powerbi_payloads() -> tuple[list[dict], str]:
             raise
         finally:
             await browser.close()
-
-    return captured_payloads, sale_ui or "unknown"
-
-
-# ---------------- XLSX BUILD ----------------
-def build_xlsx(captured_payloads: list[dict], sale_ui: str) -> Path:
-    if len(captured_payloads) < MIN_XHR_EXPECTED:
-        raise RuntimeError(f"No/low PowerBI payloads captured: {len(captured_payloads)}")
-
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-    raw_title, sale_date, saleyard, real_sale_no, title_candidates = pick_best_title(captured_payloads)
-
-    sale_meta = {
-        "sale_no": real_sale_no or sale_ui,
-        "sale_key": f"{sale_ui}_{stamp}",
-        "capture_id": stamp,
-        "sale_date": sale_date,
-        "saleyard": saleyard,
-        "raw_title": raw_title,
-    }
-
-    debug_skips = []
-    all_rows = []
-    for i, payload in enumerate(captured_payloads):
-        all_rows.extend(extract_rows_from_payload(payload, sale_meta, i, debug_skips))
-
-    df_rows = pd.DataFrame(all_rows)
-
-    # Ensure columns exist
-    for k in KEYS:
-        if k not in df_rows.columns:
-            df_rows[k] = None
-    for m in MEASURES:
-        if m not in df_rows.columns:
-            df_rows[m] = None
-
-    df_rows["price_domain_conflict"] = df_rows[KG_COLS].notna().any(axis=1) & df_rows[HD_COLS].notna().any(axis=1)
-
-    def first_non_null(series):
-        for v in series:
-            if pd.notna(v):
-                return v
-        return None
-
-    df_master = (
-        df_rows.drop_duplicates()
-        .groupby(KEYS, dropna=False)[MEASURES + ["price_domain_conflict"]]
-        .agg(first_non_null)
-        .reset_index()
-    )
-
-    df_summary = df_master[df_master["table_type"] == "summary"].copy()
-    df_breakdown = df_master[df_master["table_type"] == "breakdown"].copy()
-
-    if not df_summary.empty:
-        df_summary = df_summary.sort_values(["sale_date", "sale_no", "section", "row_level", "class"], na_position="last")
-    if not df_breakdown.empty:
-        df_breakdown = df_breakdown.sort_values(
-            ["sale_date", "sale_no", "class", "row_level", "weight_from", "weight_to", "weight_range"],
-            na_position="last"
-        )
-
-    out_path = OUT_DIR / f"AgOnline_{sale_meta['sale_no']}_{stamp}.xlsx"
-
-    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
-        pd.DataFrame([{
-            **sale_meta,
-            "payload_count": len(captured_payloads),
-            "title_candidates_seen": len(title_candidates),
-        }]).to_excel(writer, index=False, sheet_name="sales")
-
-        df_summary.to_excel(writer, index=False, sheet_name="summary_rows")
-        df_breakdown.to_excel(writer, index=False, sheet_name="breakdown_rows")
-
-        # optional: include debug sheet only if there are skips (doesn't change your 3 core sheets)
-        if debug_skips:
-            pd.DataFrame(debug_skips).to_excel(writer, index=False, sheet_name="debug_skipped_rows")
-
-    print("Wrote XLSX:", out_path)
-    print("Payloads captured:", len(captured_payloads))
-    print("Rows (summary):", len(df_summary))
-    print("Rows (breakdown):", len(df_breakdown))
-
-    return out_path
-
-
-# ---------------- EMAIL ----------------
-def email_file(path: Path):
-    email_from = os.environ["EMAIL_FROM"]
-    email_pass = os.environ["EMAIL_PASS"]
-
-    msg = EmailMessage()
-    msg["Subject"] = f"AgOnline XLSX (3 sheets) – {path.name}"
-    msg["From"] = email_from
-    msg["To"] = TO_EMAIL
-    msg.set_content(
-        "Attached: AgOnline XLSX export.\n\n"
-        "Sheets:\n"
-        " - sales\n"
-        " - summary_rows\n"
-        " - breakdown_rows\n"
-    )
-
-    msg.add_attachment(
-        path.read_bytes(),
-        maintype="application",
-        subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename=path.name,
-    )
-
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
-        server.ehlo()
-        server.starttls()
-        server.ehlo()
-        server.login(email_from, email_pass)
-        server.send_message(msg)
-
-    print("Email sent to:", TO_EMAIL)
-
-
-# ---------------- MAIN ----------------
-async def run():
-    payloads, sale_ui = await capture_powerbi_payloads()
-    xlsx_path = build_xlsx(payloads, sale_ui)
-    email_file(xlsx_path)
 
 
 if __name__ == "__main__":
