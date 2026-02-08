@@ -1,41 +1,19 @@
-# ==========================================
-# AgOnline PowerBI: 3 clicks -> capture sale XHR -> build clean master -> email XLSX
-# Works locally + GitHub Actions
-#
-# What it does:
-#  1) Opens https://www.agonline.co.nz/saleyard-results
-#  2) Clicks Date header twice (PowerBI state reset)
-#  3) Clicks first sale cell
-#  4) Captures ALL XHR/FETCH PowerBI payloads triggered
-#  5) Reconstructs rows (summary + breakdown) using your DSR decoder logic
-#  6) Writes master-Raw.xlsx
-#  7) Emails the XLSX as an attachment (SMTP via Gmail app password)
-#
-# Required env vars (GitHub Secrets):
-#   EMAIL_FROM   (your gmail address)
-#   EMAIL_PASS   (gmail app password, no spaces)
-# Optional:
-#   EMAIL_TO     (default: dunderhenlin@gmail.com)
-# ==========================================
-
-import os, json, re, smtplib
-from datetime import datetime
-from pathlib import Path
+import os
+import re
+import json
+import smtplib
 from email.message import EmailMessage
+from datetime import datetime
 
 import pandas as pd
 from playwright.sync_api import sync_playwright
 
-# -----------------------
-# CONFIG
-# -----------------------
 URL = "https://www.agonline.co.nz/saleyard-results"
-EMAIL_TO = os.environ.get("EMAIL_TO", "dunderhenlin@gmail.com")
 OUT_XLSX = "master-Raw.xlsx"
 
-HEADLESS = True  # set False for local debugging
-WAIT_AFTER_SORT_MS = 1200
-WAIT_AFTER_CLICK_MS = 4500
+HEADLESS = True
+WAIT_AFTER_SORT_MS = 1500
+WAIT_AFTER_CLICK_MS = 9000
 MIN_XHR_EXPECTED = 3
 
 MEASURES = [
@@ -52,9 +30,6 @@ KEYS = [
     "weight_range","weight_from","weight_to"
 ]
 
-# -----------------------
-# Helpers
-# -----------------------
 def safe_get(obj, path, default=None):
     cur = obj
     for p in path:
@@ -67,31 +42,28 @@ def safe_get(obj, path, default=None):
     return cur
 
 def coerce_num(x):
-    if isinstance(x, (int, float)):
-        return x
+    if isinstance(x, (int, float)): return x
     if isinstance(x, str):
-        try:
-            return float(x)
-        except:
-            return x
+        try: return float(x)
+        except: return x
     return x
 
 def parse_weight_range(w):
-    if not w or not isinstance(w, str) or "-" not in w:
-        return None, None
-    a, b = w.split("-", 1)
-    try:
-        return int(a.strip()), int(b.strip())
-    except:
-        return None, None
+    if isinstance(w, str) and "-" in w:
+        try:
+            a, b = w.split("-", 1)
+            return int(a.strip()), int(b.strip())
+        except:
+            pass
+    return None, None
 
-def get_value_dicts(dsr: dict):
+def get_value_dicts(dsr):
     try:
         return dsr["DS"][0].get("ValueDicts", {}) or {}
     except:
         return {}
 
-def decode_vdict(schema_entry: dict, raw_value, value_dicts: dict):
+def decode_vdict(schema_entry, raw_value, value_dicts):
     dn = schema_entry.get("DN")
     if dn and dn in value_dicts and isinstance(raw_value, int):
         vd = value_dicts[dn]
@@ -101,21 +73,30 @@ def decode_vdict(schema_entry: dict, raw_value, value_dicts: dict):
 
 def norm_measure(name: str):
     n = (name or "").lower()
-    if "quantity offered" in n: return "qty_offered"
-    if "quantity sold" in n: return "qty_sold"
+    if "quantity offered" in n:
+        return "qty_offered"
+    if "quantity sold" in n:
+        return "qty_sold"
 
     if "price/kg" in n:
-        if "ave" in n or "avg" in n: return "avg_price_kg"
-        if "min" in n: return "min_price_kg"
-        if "max" in n: return "max_price_kg"
+        if "ave" in n or "avg" in n:
+            return "avg_price_kg"
+        if "min" in n:
+            return "min_price_kg"
+        if "max" in n:
+            return "max_price_kg"
 
     if "price/hd" in n:
-        if "ave" in n or "avg" in n: return "avg_price_hd"
-        if "min" in n: return "min_price_hd"
-        if "max" in n: return "max_price_hd"
+        if "ave" in n or "avg" in n:
+            return "avg_price_hd"
+        if "min" in n:
+            return "min_price_hd"
+        if "max" in n:
+            return "max_price_hd"
+
     return None
 
-def build_maps(descriptor: dict):
+def build_maps(descriptor):
     select = descriptor.get("Select", []) or []
     dim_map = {}
     meas_map = {}
@@ -129,16 +110,18 @@ def build_maps(descriptor: dict):
         nm = (s.get("Name", "") or "")
         lnm = nm.lower()
 
+        # dimensions
         if kind == 1 and isinstance(val, str) and val.startswith("G"):
             if "section" in lnm and "description" in lnm:
                 dim_map[val] = "section"
             elif "weight" in lnm:
                 dim_map[val] = "weight_range"
-            elif lnm.endswith(".class") or "transactions.class" in lnm or "class" in lnm:
+            elif "class" in lnm:
                 dim_map[val] = "class"
             else:
                 dim_map[val] = f"dim_{val}"
 
+        # measures (+ subtotal aliases)
         if kind == 2 and isinstance(val, str) and val.startswith("M"):
             m = norm_measure(nm)
             if m:
@@ -180,7 +163,6 @@ def reconstruct_full(schema, rec, prev_full):
 
     if len(full) != schema_len:
         return None
-
     return full
 
 def iter_decoded_records(records, stream_state, debug_list, sale_no, payload_idx, dm_key, node_schema=None):
@@ -200,27 +182,22 @@ def iter_decoded_records(records, stream_state, debug_list, sale_no, payload_idx
             stream_state["schema"] = schema
             prev_full = None
             stream_state["prev_full"] = None
+            continue
 
         if not schema:
-            debug_list.append({
-                "sale_no": sale_no, "payload_idx": payload_idx, "dm": dm_key, "rec_idx": rec_idx,
-                "reason": "no_schema_available"
-            })
+            debug_list.append({"sale_no": sale_no, "payload_idx": payload_idx, "dm": dm_key, "rec_idx": rec_idx, "reason": "no_schema"})
             continue
 
         full = reconstruct_full(schema, rec, prev_full)
         if full is None:
-            debug_list.append({
-                "sale_no": sale_no, "payload_idx": payload_idx, "dm": dm_key, "rec_idx": rec_idx,
-                "reason": "could_not_align_to_schema"
-            })
+            debug_list.append({"sale_no": sale_no, "payload_idx": payload_idx, "dm": dm_key, "rec_idx": rec_idx, "reason": "align_fail"})
             continue
 
         prev_full = full
         stream_state["prev_full"] = prev_full
         yield schema, full
 
-def extract_rows_from_payload(payload: dict, sale_meta: dict, payload_idx: int, debug_list: list):
+def extract_rows_from_payload(payload, sale_meta, payload_idx, debug_list):
     data = safe_get(payload, ["results", 0, "result", "data"])
     if not isinstance(data, dict):
         return []
@@ -274,15 +251,7 @@ def extract_rows_from_payload(payload: dict, sale_meta: dict, payload_idx: int, 
 
                         is_subtotal = child_dm in subtotal_members
 
-                        for schema, full in iter_decoded_records(
-                            records,
-                            stream_states[dm_key],
-                            debug_list,
-                            sale_no,
-                            payload_idx,
-                            dm_key=dm_key,
-                            node_schema=node_schema
-                        ):
+                        for schema, full in iter_decoded_records(records, stream_states[dm_key], debug_list, sale_no, payload_idx, dm_key, node_schema):
                             dims = dict(ctx)
                             measures = {}
 
@@ -325,225 +294,251 @@ def extract_rows_from_payload(payload: dict, sale_meta: dict, payload_idx: int, 
                                 "weight_to": wt,
                                 **measures
                             })
+
     return out_rows
 
-def extract_title_metadata_from_powerbi_payload(payload: dict):
-    try:
-        data = safe_get(payload, ["results", 0, "result", "data"])
-        dsr = data.get("dsr", {})
-        dm0 = safe_get(dsr, ["DS", 0, "PH", 0, "DM0"])
-        if not isinstance(dm0, list) or not dm0:
-            return None
-
-        title_text = str(dm0[0].get("M0", "") or "").strip()
-        if not title_text:
-            return None
-
-        sale_match = re.search(r"Sale\s*No\s*[:#]?\s*(\d+)", title_text, flags=re.IGNORECASE)
-        date_match = re.search(r"(\d{1,2}/\d{1,2}/\d{2,4})", title_text)
-
-        return {
-            "raw_text": title_text,
-            "sale_no": sale_match.group(1) if sale_match else None,
-            "date": date_match.group(1) if date_match else None
-        }
-    except Exception:
-        return None
-
-def find_title_like_info_from_payloads(payloads: list):
-    best = None
+def collect_candidate_titles(payloads):
+    out = []
     for p in payloads:
-        t = extract_title_metadata_from_powerbi_payload(p)
-        if t and t.get("raw_text"):
-            best = t
-            if t.get("sale_no"):
-                break
+        data = safe_get(p, ["results", 0, "result", "data"])
+        if not isinstance(data, dict):
+            continue
 
-    raw_title = best["raw_text"] if best else None
-    sale_date = best.get("date") if best else None
-    real_sale_no = best.get("sale_no") if best else None
+        dsr = data.get("dsr") or {}
+        ph0 = safe_get(dsr, ["DS", 0, "PH", 0])
+        if not isinstance(ph0, dict):
+            continue
 
+        dm0 = ph0.get("DM0")
+        if not isinstance(dm0, list) or not dm0:
+            continue
+
+        node = dm0[0]
+        if not isinstance(node, dict):
+            continue
+
+        if isinstance(node.get("M0"), str):
+            s = node["M0"].strip()
+            if s:
+                out.append(s)
+
+        if isinstance(node.get("S"), list) and isinstance(node.get("C"), list):
+            cols = [c.get("N") for c in node["S"] if isinstance(c, dict)]
+            if "M0" in cols:
+                idx = cols.index("M0")
+                if idx < len(node["C"]) and isinstance(node["C"][idx], str):
+                    s = node["C"][idx].strip()
+                    if s:
+                        out.append(s)
+    return out
+
+def pick_best_title(payloads):
+    candidates = collect_candidate_titles(payloads)
+
+    seen = set()
+    uniq = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            uniq.append(c)
+
+    def score(s: str) -> int:
+        t = s.strip().lower()
+        if not t:
+            return -10**9
+        if "select one sale to view" in t:
+            return -10**9
+
+        sc = 0
+        if "sale no" in t: sc += 100
+        if "report for" in t: sc += 80
+        if "pgg" in t: sc += 60
+        if "market report" in t: sc += 40
+        if re.search(r"\d{1,2}/\d{1,2}/\d{2,4}", t): sc += 30
+        sc += min(len(t), 120)
+        return sc
+
+    best = max(uniq, key=score) if uniq else None
+    if not best:
+        return None, None, None, None, uniq
+
+    sale_match = re.search(r"Sale\s*No\s*[:#]?\s*(\d+)", best, flags=re.IGNORECASE)
+    date_match = re.search(r"(\d{1,2}/\d{1,2}/\d{2,4})", best)
     saleyard = None
-    if raw_title:
-        m = re.search(r"Report\s+For\s+(.*?)\s+on\s*:", raw_title, flags=re.IGNORECASE)
-        saleyard = m.group(1).strip() if m else None
+    m = re.search(r"Report\s+For\s+(.*?)\s+on\s*:", best, flags=re.IGNORECASE)
+    if m:
+        saleyard = m.group(1).strip()
 
-    return raw_title, sale_date, saleyard, real_sale_no
+    return (
+        best,
+        date_match.group(1) if date_match else None,
+        saleyard,
+        sale_match.group(1) if sale_match else None,
+        uniq
+    )
 
-def send_email_with_attachment(subject: str, body: str, filepath: str):
-    email_from = os.environ["EMAIL_FROM"]
-    email_pass = os.environ["EMAIL_PASS"]
+def send_email(subject: str, body: str, attachment_path: str):
+    from_addr = os.environ["EMAIL_FROM"]
+    to_addr = os.environ["EMAIL_TO"]
+    app_pass = os.environ["EMAIL_PASS"]
 
     msg = EmailMessage()
+    msg["From"] = from_addr
+    msg["To"] = to_addr
     msg["Subject"] = subject
-    msg["From"] = email_from
-    msg["To"] = EMAIL_TO
     msg.set_content(body)
 
-    with open(filepath, "rb") as f:
+    with open(attachment_path, "rb") as f:
         data = f.read()
-
     msg.add_attachment(
         data,
         maintype="application",
         subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename=os.path.basename(filepath),
+        filename=os.path.basename(attachment_path),
     )
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(email_from, email_pass)
-        server.send_message(msg)
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+        smtp.login(from_addr, app_pass)
+        smtp.send_message(msg)
 
-# -----------------------
-# Run: 3 clicks + capture payloads
-# -----------------------
-captured_payloads = []
-sale_no_ui = None
+def run_once():
+    captured_payloads = []
+    sale_ui = None
 
-with sync_playwright() as p:
-    browser = p.chromium.launch(headless=HEADLESS)
-    context = browser.new_context()
-    page = context.new_page()
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=HEADLESS, args=["--no-sandbox"])
+        context = browser.new_context(viewport={"width": 1280, "height": 720})
+        page = context.new_page()
 
-    # capture only PowerBI-shaped payloads
-    def on_response(resp):
-        try:
-            if resp.request.resource_type not in ("xhr", "fetch"):
-                return
-            ct = (resp.headers.get("content-type") or "").lower()
-            if "application/json" not in ct:
-                return
-            body = resp.json()
-            if (
-                isinstance(body, dict)
-                and isinstance(body.get("results"), list)
-                and body["results"]
-                and isinstance(safe_get(body, ["results", 0, "result", "data"]), dict)
-            ):
+        def on_response(resp):
+            try:
+                if resp.request.resource_type not in ("xhr", "fetch"):
+                    return
+                ct = (resp.headers.get("content-type") or "").lower()
+                if "application/json" not in ct:
+                    return
+                body = resp.json()
+                if not (
+                    isinstance(body, dict)
+                    and isinstance(body.get("results"), list)
+                    and body["results"]
+                    and isinstance(safe_get(body, ["results", 0, "result", "data"]), dict)
+                ):
+                    return
                 captured_payloads.append(body)
-        except Exception:
-            pass
+            except:
+                pass
 
-    page.on("response", on_response)
+        page.on("response", on_response)
 
-    page.goto(URL, timeout=60000)
+        page.goto(URL, timeout=90000)
+        page.wait_for_selector("iframe", timeout=90000)
 
-    # find powerbi iframe
-    page.wait_for_selector("iframe", timeout=60000)
-    powerbi_frame = None
-    for frame in page.frames:
-        if "powerbi" in frame.url.lower():
-            powerbi_frame = frame
-            break
-    if not powerbi_frame:
+        # Find PowerBI iframe
+        powerbi_frame = None
+        for fr in page.frames:
+            if "powerbi" in (fr.url or "").lower():
+                powerbi_frame = fr
+                break
+        if not powerbi_frame:
+            browser.close()
+            raise RuntimeError("Power BI iframe not found")
+
+        powerbi_frame.wait_for_selector(".pivotTableCellNoWrap", timeout=90000)
+
+        # Click Date twice
+        date_header = powerbi_frame.get_by_role("columnheader", name="Date")
+        date_header.click()
+        powerbi_frame.wait_for_timeout(WAIT_AFTER_SORT_MS)
+        date_header.click()
+        powerbi_frame.wait_for_timeout(WAIT_AFTER_SORT_MS)
+
+        # Click first sale
+        first_sale = powerbi_frame.locator(".pivotTableCellNoWrap").first
+        sale_ui = (first_sale.inner_text() or "").strip()
+        first_sale.click()
+        powerbi_frame.wait_for_timeout(WAIT_AFTER_CLICK_MS)
+
         browser.close()
-        raise RuntimeError("Power BI iframe not found")
 
-    # wait for pivot cells
-    powerbi_frame.wait_for_selector(".pivotTableCellNoWrap", timeout=60000)
+    if len(captured_payloads) < MIN_XHR_EXPECTED:
+        raise RuntimeError(f"Too few payloads captured: {len(captured_payloads)}")
 
-    # Click 1 & 2: Date header twice (reset)
-    date_header = powerbi_frame.get_by_role("columnheader", name="Date")
-    date_header.click()
-    powerbi_frame.wait_for_timeout(WAIT_AFTER_SORT_MS)
-    date_header.click()
-    powerbi_frame.wait_for_timeout(WAIT_AFTER_SORT_MS)
+    stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    raw_title, sale_date, saleyard, real_sale_no, candidates = pick_best_title(captured_payloads)
 
-    # Click 3: first sale
-    first_sale = powerbi_frame.locator(".pivotTableCellNoWrap").first
-    sale_no_ui = first_sale.inner_text().strip()
-    first_sale.click()
-    powerbi_frame.wait_for_timeout(WAIT_AFTER_CLICK_MS)
+    sale_meta = {
+        "sale_no": real_sale_no or sale_ui or "unknown",
+        "sale_key": f"{real_sale_no or sale_ui or 'unknown'}_{stamp}",
+        "capture_id": stamp,
+        "sale_date": sale_date,
+        "saleyard": saleyard,
+        "raw_title": raw_title
+    }
 
-    browser.close()
+    debug_skips = []
+    all_rows = []
+    for i, payload in enumerate(captured_payloads):
+        all_rows.extend(extract_rows_from_payload(payload, sale_meta, i, debug_skips))
 
-if len(captured_payloads) < MIN_XHR_EXPECTED:
-    raise RuntimeError(f"No/low PowerBI payloads captured: {len(captured_payloads)}")
+    df_rows = pd.DataFrame(all_rows)
 
-# -----------------------
-# Build meta + rows
-# -----------------------
-stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
-sale_key = f"{sale_no_ui}_{stamp}"
-raw_title, sale_date, saleyard, real_sale_no = find_title_like_info_from_payloads(captured_payloads)
+    for k in KEYS:
+        if k not in df_rows.columns:
+            df_rows[k] = None
+    for m in MEASURES:
+        if m not in df_rows.columns:
+            df_rows[m] = None
 
-sale_meta = {
-    "sale_no": real_sale_no or sale_no_ui,
-    "sale_key": sale_key,
-    "capture_id": stamp,
-    "sale_date": sale_date,
-    "saleyard": saleyard,
-    "raw_title": raw_title
-}
+    df_rows["price_domain_conflict"] = df_rows[KG_COLS].notna().any(axis=1) & df_rows[HD_COLS].notna().any(axis=1)
 
-debug_skips = []
-all_rows = []
-for idx, payload in enumerate(captured_payloads):
-    all_rows.extend(extract_rows_from_payload(payload, sale_meta, idx, debug_skips))
+    def first_non_null(series):
+        for v in series:
+            if pd.notna(v):
+                return v
+        return None
 
-df_rows = pd.DataFrame(all_rows)
-
-# Ensure columns exist
-for k in KEYS:
-    if k not in df_rows.columns:
-        df_rows[k] = None
-for m in MEASURES:
-    if m not in df_rows.columns:
-        df_rows[m] = None
-
-df_rows["price_domain_conflict"] = df_rows[KG_COLS].notna().any(axis=1) & df_rows[HD_COLS].notna().any(axis=1)
-
-def first_non_null(series):
-    for v in series:
-        if pd.notna(v):
-            return v
-    return None
-
-df_master = (
-    df_rows.drop_duplicates()
-          .groupby(KEYS, dropna=False)[MEASURES + ["price_domain_conflict"]]
-          .agg(first_non_null)
-          .reset_index()
-)
-
-df_summary = df_master[df_master["table_type"] == "summary"].copy()
-df_breakdown = df_master[df_master["table_type"] == "breakdown"].copy()
-
-if not df_summary.empty:
-    df_summary = df_summary.sort_values(["sale_date","sale_no","section","row_level","class"], na_position="last")
-if not df_breakdown.empty:
-    df_breakdown = df_breakdown.sort_values(
-        ["sale_date","sale_no","class","row_level","weight_from","weight_to","weight_range"],
-        na_position="last"
+    df_master = (
+        df_rows.drop_duplicates()
+              .groupby(KEYS, dropna=False)[MEASURES + ["price_domain_conflict"]]
+              .agg(first_non_null)
+              .reset_index()
     )
 
-# Write XLSX
-with pd.ExcelWriter(OUT_XLSX, engine="openpyxl") as writer:
-    pd.DataFrame([{
-        **sale_meta,
-        "payload_count": len(captured_payloads)
-    }]).to_excel(writer, index=False, sheet_name="sales")
-    df_summary.to_excel(writer, index=False, sheet_name="summary_rows")
-    df_breakdown.to_excel(writer, index=False, sheet_name="breakdown_rows")
-    if debug_skips:
-        pd.DataFrame(debug_skips).to_excel(writer, index=False, sheet_name="debug_skipped_rows")
+    df_summary = df_master[df_master["table_type"] == "summary"].copy()
+    df_breakdown = df_master[df_master["table_type"] == "breakdown"].copy()
 
-# -----------------------
-# Email XLSX
-# -----------------------
-subject = f"AgOnline scrape: sale {sale_meta['sale_no']} ({sale_meta['capture_id']})"
-body = (
-    f"AgOnline scrape complete.\n\n"
-    f"sale_no: {sale_meta['sale_no']}\n"
-    f"sale_key: {sale_meta['sale_key']}\n"
-    f"sale_date: {sale_meta['sale_date']}\n"
-    f"saleyard: {sale_meta['saleyard']}\n"
-    f"payloads captured: {len(captured_payloads)}\n"
-    f"summary rows: {len(df_summary)}\n"
-    f"breakdown rows: {len(df_breakdown)}\n"
-)
+    with pd.ExcelWriter(OUT_XLSX, engine="openpyxl") as writer:
+        pd.DataFrame([{
+            **sale_meta,
+            "payload_count": len(captured_payloads),
+            "title_candidates_seen": len(candidates),
+        }]).to_excel(writer, index=False, sheet_name="sales")
+        df_summary.to_excel(writer, index=False, sheet_name="summary_rows")
+        df_breakdown.to_excel(writer, index=False, sheet_name="breakdown_rows")
+        if debug_skips:
+            pd.DataFrame(debug_skips).to_excel(writer, index=False, sheet_name="debug_skipped_rows")
 
-send_email_with_attachment(subject, body, OUT_XLSX)
+    # sanity: avoid empty emails
+    if df_master.empty:
+        raise RuntimeError("Decoded rows are empty. Not emailing an empty file.")
 
-print("DONE. Email sent to:", EMAIL_TO)
-print("Wrote:", OUT_XLSX)
+    return sale_meta, len(captured_payloads), len(df_summary), len(df_breakdown)
+
+if __name__ == "__main__":
+    sale_meta, payloads, nsum, nbd = run_once()
+
+    subject = f"AgOnline scrape OK — Sale {sale_meta['sale_no']} ({payloads} payloads)"
+    body = (
+        f"Scrape completed.\n\n"
+        f"Sale: {sale_meta['sale_no']}\n"
+        f"Saleyard: {sale_meta['saleyard']}\n"
+        f"Date: {sale_meta['sale_date']}\n"
+        f"Payloads: {payloads}\n"
+        f"Summary rows: {nsum}\n"
+        f"Breakdown rows: {nbd}\n\n"
+        f"Raw title:\n{sale_meta['raw_title']}\n"
+    )
+
+    send_email(subject, body, OUT_XLSX)
+    print("EMAIL SENT:", subject)
