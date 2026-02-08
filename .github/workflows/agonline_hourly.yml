@@ -31,4 +31,16 @@ jobs:
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: |
-          python send_mail.py
+          python send_mail.py     
+        
+      - name: Upload debug artifacts (only if failed)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug
+          path: |
+            debug_page.png
+            debug_page.html
+            debug_no_powerbi_frame.png
+          if-no-files-found: ignore
+
