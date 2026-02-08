@@ -1,4 +1,4 @@
-name: AgOnline extraction + email (debug-safe)
+name: AgOnline → XLSX (3 sheets) + email
 
 on:
   workflow_dispatch:
@@ -6,16 +6,11 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-
-      - name: Show repo contents
-        run: |
-          pwd
-          ls -la
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -25,10 +20,10 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install playwright
+          pip install playwright pandas openpyxl
           python -m playwright install --with-deps chromium
 
-      - name: Run extraction + email
+      - name: Run extraction + email XLSX
         env:
           CI: "1"
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
@@ -36,9 +31,11 @@ jobs:
         run: |
           python send_mail.py
 
-      - name: Upload debug artifacts
+      - name: Upload output + debug (if any)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug
-          path: debug/
+          name: agonline_output
+          path: |
+            output/
+            debug/
