@@ -1,46 +1,42 @@
-name: AgOnline hourly scrape
+name: AgOnline scrape + email (test)
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 * * * *"   # every hour
+  # uncomment if you want it hourly later
+  # schedule:
+  #   - cron: "5 * * * *"
 
 jobs:
-  scrape:
+  run:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas openpyxl playwright
-          playwright install --with-deps chromium
+          pip install playwright
+          python -m playwright install --with-deps chromium
 
-      - name: Run scraper (emails CSV in-memory)
+      - name: Run extraction + email
         env:
+          CI: "1"
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
-          EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: |
-          python send_mail.py     
-        
-      - name: Upload debug artifacts (only if failed)
-        if: failure()
+          python .github/workflows/send_mail.py
+
+      - name: Upload xhr_dump artifact (debug)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug
-          path: |
-            debug_page.png
-            debug_page.html
-            debug_no_powerbi_frame.png
-          if-no-files-found: ignore
-
+          name: xhr_dump
+          path: xhr_dump/
