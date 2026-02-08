@@ -1,16 +1,24 @@
-name: AgOnline → XLSX (3 sheets) + email
+name: AgOnline hourly master update
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "5 * * * *"  # every hour at minute 05 (UTC)
+
+permissions:
+  contents: write
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -23,7 +31,12 @@ jobs:
           pip install playwright pandas openpyxl
           python -m playwright install --with-deps chromium
 
-      - name: Run extraction + email XLSX
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Run scraper (updates master + state + emails)
         env:
           CI: "1"
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
@@ -31,11 +44,9 @@ jobs:
         run: |
           python send_mail.py
 
-      - name: Upload output + debug (if any)
+      - name: Upload debug artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: agonline_output
-          path: |
-            output/
-            debug/
+          name: debug
+          path: debug/
