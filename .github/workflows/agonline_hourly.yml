@@ -1,4 +1,4 @@
-name: AgOnline extraction + email (in-memory)
+name: AgOnline extraction + email (test)
 
 on:
   workflow_dispatch:
@@ -12,6 +12,11 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
+      - name: Debug (prove file is present)
+        run: |
+          pwd
+          ls -la
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -23,10 +28,10 @@ jobs:
           pip install playwright
           python -m playwright install --with-deps chromium
 
-      - name: Run extraction + email
+      - name: Run send_mail.py (repo root)
         env:
           CI: "1"
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
         run: |
-          python .github/workflows/send_mail.py
+          python send_mail.py
