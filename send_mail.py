@@ -1,6 +1,5 @@
 import os
 import re
-import json
 import smtplib
 from email.message import EmailMessage
 from datetime import datetime
@@ -9,7 +8,6 @@ import pandas as pd
 from playwright.sync_api import sync_playwright
 
 URL = "https://www.agonline.co.nz/saleyard-results"
-OUT_XLSX = "master-Raw.xlsx"
 
 HEADLESS = True
 WAIT_AFTER_SORT_MS = 1500
@@ -30,6 +28,7 @@ KEYS = [
     "weight_range","weight_from","weight_to"
 ]
 
+# ---------------- HELPERS ----------------
 def safe_get(obj, path, default=None):
     cur = obj
     for p in path:
@@ -110,7 +109,6 @@ def build_maps(descriptor):
         nm = (s.get("Name", "") or "")
         lnm = nm.lower()
 
-        # dimensions
         if kind == 1 and isinstance(val, str) and val.startswith("G"):
             if "section" in lnm and "description" in lnm:
                 dim_map[val] = "section"
@@ -121,7 +119,6 @@ def build_maps(descriptor):
             else:
                 dim_map[val] = f"dim_{val}"
 
-        # measures (+ subtotal aliases)
         if kind == 2 and isinstance(val, str) and val.startswith("M"):
             m = norm_measure(nm)
             if m:
@@ -246,8 +243,7 @@ def extract_rows_from_payload(payload, sale_meta, payload_idx, debug_list):
                             continue
 
                         dm_key = f"{dm_name}->{child_dm}"
-                        if dm_key not in stream_states:
-                            stream_states[dm_key] = {}
+                        stream_states.setdefault(dm_key, {})
 
                         is_subtotal = child_dm in subtotal_members
 
@@ -360,7 +356,7 @@ def pick_best_title(payloads):
 
     best = max(uniq, key=score) if uniq else None
     if not best:
-        return None, None, None, None, uniq
+        return None, None, None, None
 
     sale_match = re.search(r"Sale\s*No\s*[:#]?\s*(\d+)", best, flags=re.IGNORECASE)
     date_match = re.search(r"(\d{1,2}/\d{1,2}/\d{2,4})", best)
@@ -373,11 +369,10 @@ def pick_best_title(payloads):
         best,
         date_match.group(1) if date_match else None,
         saleyard,
-        sale_match.group(1) if sale_match else None,
-        uniq
+        sale_match.group(1) if sale_match else None
     )
 
-def send_email(subject: str, body: str, attachment_path: str):
+def send_email(subject: str, body: str, attachments: dict | None = None):
     from_addr = os.environ["EMAIL_FROM"]
     to_addr = os.environ["EMAIL_TO"]
     app_pass = os.environ["EMAIL_PASS"]
@@ -388,14 +383,15 @@ def send_email(subject: str, body: str, attachment_path: str):
     msg["Subject"] = subject
     msg.set_content(body)
 
-    with open(attachment_path, "rb") as f:
-        data = f.read()
-    msg.add_attachment(
-        data,
-        maintype="application",
-        subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename=os.path.basename(attachment_path),
-    )
+    # Attach CSVs in-memory (no files)
+    if attachments:
+        for filename, text in attachments.items():
+            msg.add_attachment(
+                text.encode("utf-8"),
+                maintype="text",
+                subtype="csv",
+                filename=filename,
+            )
 
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
         smtp.login(from_addr, app_pass)
@@ -434,7 +430,6 @@ def run_once():
         page.goto(URL, timeout=90000)
         page.wait_for_selector("iframe", timeout=90000)
 
-        # Find PowerBI iframe
         powerbi_frame = None
         for fr in page.frames:
             if "powerbi" in (fr.url or "").lower():
@@ -446,14 +441,14 @@ def run_once():
 
         powerbi_frame.wait_for_selector(".pivotTableCellNoWrap", timeout=90000)
 
-        # Click Date twice
+        # 1) click Date twice (unstick)
         date_header = powerbi_frame.get_by_role("columnheader", name="Date")
         date_header.click()
         powerbi_frame.wait_for_timeout(WAIT_AFTER_SORT_MS)
         date_header.click()
         powerbi_frame.wait_for_timeout(WAIT_AFTER_SORT_MS)
 
-        # Click first sale
+        # 2) click first sale
         first_sale = powerbi_frame.locator(".pivotTableCellNoWrap").first
         sale_ui = (first_sale.inner_text() or "").strip()
         first_sale.click()
@@ -465,11 +460,12 @@ def run_once():
         raise RuntimeError(f"Too few payloads captured: {len(captured_payloads)}")
 
     stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
-    raw_title, sale_date, saleyard, real_sale_no, candidates = pick_best_title(captured_payloads)
+    raw_title, sale_date, saleyard, real_sale_no = pick_best_title(captured_payloads)
 
+    sale_no = real_sale_no or sale_ui or "unknown"
     sale_meta = {
-        "sale_no": real_sale_no or sale_ui or "unknown",
-        "sale_key": f"{real_sale_no or sale_ui or 'unknown'}_{stamp}",
+        "sale_no": sale_no,
+        "sale_key": f"{sale_no}_{stamp}",
         "capture_id": stamp,
         "sale_date": sale_date,
         "saleyard": saleyard,
@@ -482,6 +478,8 @@ def run_once():
         all_rows.extend(extract_rows_from_payload(payload, sale_meta, i, debug_skips))
 
     df_rows = pd.DataFrame(all_rows)
+    if df_rows.empty:
+        raise RuntimeError("Decoded rows empty (no data).")
 
     for k in KEYS:
         if k not in df_rows.columns:
@@ -508,25 +506,19 @@ def run_once():
     df_summary = df_master[df_master["table_type"] == "summary"].copy()
     df_breakdown = df_master[df_master["table_type"] == "breakdown"].copy()
 
-    with pd.ExcelWriter(OUT_XLSX, engine="openpyxl") as writer:
-        pd.DataFrame([{
-            **sale_meta,
-            "payload_count": len(captured_payloads),
-            "title_candidates_seen": len(candidates),
-        }]).to_excel(writer, index=False, sheet_name="sales")
-        df_summary.to_excel(writer, index=False, sheet_name="summary_rows")
-        df_breakdown.to_excel(writer, index=False, sheet_name="breakdown_rows")
-        if debug_skips:
-            pd.DataFrame(debug_skips).to_excel(writer, index=False, sheet_name="debug_skipped_rows")
-
-    # sanity: avoid empty emails
-    if df_master.empty:
-        raise RuntimeError("Decoded rows are empty. Not emailing an empty file.")
-
-    return sale_meta, len(captured_payloads), len(df_summary), len(df_breakdown)
+    return sale_meta, len(captured_payloads), df_summary, df_breakdown
 
 if __name__ == "__main__":
-    sale_meta, payloads, nsum, nbd = run_once()
+    sale_meta, payloads, df_summary, df_breakdown = run_once()
+
+    # Convert to CSV strings (in memory)
+    # Keep them reasonably sized: head if huge
+    max_rows = 2500
+    sum_out = df_summary.head(max_rows)
+    brk_out = df_breakdown.head(max_rows)
+
+    summary_csv = sum_out.to_csv(index=False)
+    breakdown_csv = brk_out.to_csv(index=False)
 
     subject = f"AgOnline scrape OK — Sale {sale_meta['sale_no']} ({payloads} payloads)"
     body = (
@@ -535,10 +527,18 @@ if __name__ == "__main__":
         f"Saleyard: {sale_meta['saleyard']}\n"
         f"Date: {sale_meta['sale_date']}\n"
         f"Payloads: {payloads}\n"
-        f"Summary rows: {nsum}\n"
-        f"Breakdown rows: {nbd}\n\n"
+        f"Summary rows: {len(df_summary)} (attached up to {max_rows})\n"
+        f"Breakdown rows: {len(df_breakdown)} (attached up to {max_rows})\n\n"
         f"Raw title:\n{sale_meta['raw_title']}\n"
     )
 
-    send_email(subject, body, OUT_XLSX)
+    send_email(
+        subject,
+        body,
+        attachments={
+            f"summary_rows_{sale_meta['sale_no']}.csv": summary_csv,
+            f"breakdown_rows_{sale_meta['sale_no']}.csv": breakdown_csv,
+        }
+    )
+
     print("EMAIL SENT:", subject)
