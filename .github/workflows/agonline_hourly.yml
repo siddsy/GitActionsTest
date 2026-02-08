@@ -1,10 +1,7 @@
-name: AgOnline scrape + email (test)
+name: AgOnline extraction + email (in-memory)
 
 on:
   workflow_dispatch:
-  # uncomment if you want it hourly later
-  # schedule:
-  #   - cron: "5 * * * *"
 
 jobs:
   run:
@@ -33,10 +30,3 @@ jobs:
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
         run: |
           python .github/workflows/send_mail.py
-
-      - name: Upload xhr_dump artifact (debug)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: xhr_dump
-          path: xhr_dump/
