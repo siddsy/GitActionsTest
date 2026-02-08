@@ -1,21 +1,13 @@
 import json
 import os
 import re
-import glob
 import smtplib
-from datetime import datetime
-from pathlib import Path
+from datetime import datetime, timezone
 from email.message import EmailMessage
 
 from playwright.sync_api import sync_playwright
 
-# -----------------------
-# CONFIG
-# -----------------------
 URL = "https://www.agonline.co.nz/saleyard-results"
-
-OUT_DIR = Path("xhr_dump")
-OUT_DIR.mkdir(exist_ok=True)
 
 WAIT_AFTER_SORT_MS = 1200
 WAIT_AFTER_CLICK_MS = 4500
@@ -28,23 +20,11 @@ TO_EMAIL = "dunderhenlin@gmail.com"
 
 
 def safe_name(s: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9._-]+", "_", s)[:120]
+    return re.sub(r"[^a-zA-Z0-9._-]+", "_", s)[:120] or "unknown"
 
 
-def newest_json() -> Path:
-    files = glob.glob("xhr_dump/*.json")
-    if not files:
-        raise RuntimeError("No JSON files found in xhr_dump/")
-    files.sort(key=os.path.getmtime, reverse=True)
-    return Path(files[0])
-
-
-def extract_xhr_and_save() -> Path:
-    headless = True
-    # locally you might want headful, but in Actions it must be headless
-    if os.getenv("CI", "").lower() in ("", "0", "false", "no"):
-        # if you want local headful testing, set CI=0
-        headless = False
+def extract_xhr_payload() -> dict:
+    headless = True  # Actions must be headless
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
@@ -59,29 +39,25 @@ def extract_xhr_and_save() -> Path:
                     return
 
                 ct = (resp.headers.get("content-type") or "").lower()
-
-                entry = {
-                    "url": resp.url,
-                    "status": resp.status,
-                    "content_type": ct,
-                }
+                entry = {"url": resp.url, "status": resp.status, "content_type": ct}
 
                 if "application/json" in ct:
-                    entry["body"] = resp.json()
+                    try:
+                        entry["body"] = resp.json()
+                    except Exception:
+                        entry["body"] = None
+                        entry["json_error"] = True
                 else:
                     entry["body"] = None
 
                 captured.append(entry)
             except Exception:
-                # don't kill the run on a single bad response parse
                 pass
 
         page.on("response", on_response)
 
-        # Load page (no networkidle)
         page.goto(URL, timeout=60000)
 
-        # Find Power BI iframe
         page.wait_for_selector("iframe", timeout=60000)
 
         powerbi_frame = None
@@ -89,15 +65,13 @@ def extract_xhr_and_save() -> Path:
             if "powerbi" in frame.url.lower():
                 powerbi_frame = frame
                 break
-
         if not powerbi_frame:
             browser.close()
             raise RuntimeError("Power BI iframe not found")
 
-        # Wait for table cells inside iframe
         powerbi_frame.wait_for_selector(".pivotTableCellNoWrap", timeout=60000)
 
-        # Reset visual state: sort Date twice
+        # Reset state: sort Date twice
         date_header = powerbi_frame.get_by_role("columnheader", name="Date")
         date_header.click()
         powerbi_frame.wait_for_timeout(WAIT_AFTER_SORT_MS)
@@ -116,55 +90,57 @@ def extract_xhr_and_save() -> Path:
         first_sale.click()
         powerbi_frame.wait_for_timeout(WAIT_AFTER_CLICK_MS)
 
+        browser.close()
+
         if len(captured) < MIN_XHR_EXPECTED:
-            browser.close()
             raise RuntimeError(
                 f"FAILED: Only captured {len(captured)} XHR/fetch responses after click "
                 f"(expected at least {MIN_XHR_EXPECTED})."
             )
 
-        stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
-        out_file = OUT_DIR / f"sale_{safe_name(sale_no)}_{stamp}.json"
+        now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
-        out_file.write_text(
-            json.dumps(
-                {
-                    "sale_no": sale_no,
-                    "captured_count": len(captured),
-                    "captured": captured,
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-
-        print(f"SUCCESS: Captured {len(captured)} XHR responses")
-        print(f"Saved → {out_file}")
-
-        browser.close()
-        return out_file
+        # This is the in-memory “stored variable” result you wanted:
+        payload = {
+            "source_url": URL,
+            "sale_no": sale_no,
+            "captured_count": len(captured),
+            "captured": captured,
+            "utc_timestamp": now,
+        }
+        return payload
 
 
-def send_email_with_attachment(attachment: Path):
+def send_email(payload: dict):
     email_from = os.environ["EMAIL_FROM"]
     email_pass = os.environ["EMAIL_PASS"]
 
+    sale_no = payload.get("sale_no", "unknown")
+    count = payload.get("captured_count", 0)
+    stamp = payload.get("utc_timestamp", datetime.utcnow().strftime("%Y%m%dT%H%M%SZ"))
+
+    filename = f"sale_{safe_name(str(sale_no))}_{stamp}.json"
+    json_bytes = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+
     msg = EmailMessage()
-    msg["Subject"] = f"AgOnline extraction test – {attachment.name}"
+    msg["Subject"] = f"AgOnline extraction test – {sale_no} ({count} XHR)"
     msg["From"] = email_from
     msg["To"] = TO_EMAIL
+
     msg.set_content(
-        "Extraction test from GitHub Actions.\n\n"
-        f"Attached: {attachment.name}\n"
-        "If you received this, extraction + email both worked."
+        "Extraction ran in GitHub Actions.\n\n"
+        f"Sale: {sale_no}\n"
+        f"Captured XHR/fetch responses: {count}\n"
+        f"Timestamp (UTC): {stamp}\n\n"
+        "Attached is the full JSON payload captured in-memory."
     )
 
+    # Attach JSON (no file written)
     msg.add_attachment(
-        attachment.read_bytes(),
+        json_bytes,
         maintype="application",
         subtype="json",
-        filename=attachment.name,
+        filename=filename,
     )
 
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
@@ -174,15 +150,13 @@ def send_email_with_attachment(attachment: Path):
         server.login(email_from, email_pass)
         server.send_message(msg)
 
-    print(f"Email sent to {TO_EMAIL} with attachment: {attachment.name}")
+    print(f"Email sent to {TO_EMAIL} with attachment: {filename}")
 
 
 def main():
-    # 1) Run extraction (this is what you want to test)
-    out_file = extract_xhr_and_save()
-
-    # 2) Email the output JSON
-    send_email_with_attachment(out_file)
+    payload = extract_xhr_payload()
+    print(f"Captured responses: {payload['captured_count']}")
+    send_email(payload)
 
 
 if __name__ == "__main__":
