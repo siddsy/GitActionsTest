@@ -402,8 +402,15 @@ def run_once():
     sale_ui = None
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=HEADLESS, args=["--no-sandbox"])
-        context = browser.new_context(viewport={"width": 1280, "height": 720})
+        browser = p.chromium.launch(
+            headless=HEADLESS,
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
+        )
+        context = browser.new_context(
+            viewport={"width": 1280, "height": 720},
+            user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+        )
         page = context.new_page()
 
         def on_response(resp):
@@ -427,21 +434,42 @@ def run_once():
 
         page.on("response", on_response)
 
-        page.goto(URL, timeout=90000)
-        page.wait_for_selector("iframe", timeout=90000)
+        page.goto(URL, wait_until="domcontentloaded", timeout=90000)
+        page.wait_for_load_state("networkidle", timeout=90000)
 
+        # Try to find iframe for up to 90s, otherwise dump debug artifacts
+        try:
+            page.wait_for_selector("iframe", timeout=90000)
+        except Exception:
+            # DEBUG OUTPUTS (for Actions artifacts)
+            page.screenshot(path="debug_page.png", full_page=True)
+            html = page.content()
+            with open("debug_page.html", "w", encoding="utf-8") as f:
+                f.write(html)
+
+            # also log a short snippet to Actions
+            title = page.title()
+            print("DEBUG: page title =", title)
+            print("DEBUG: first 500 chars of HTML:")
+            print(html[:500])
+
+            browser.close()
+            raise RuntimeError("No iframe found. Saved debug_page.png and debug_page.html")
+
+        # Find PowerBI iframe
         powerbi_frame = None
         for fr in page.frames:
             if "powerbi" in (fr.url or "").lower():
                 powerbi_frame = fr
                 break
         if not powerbi_frame:
+            page.screenshot(path="debug_no_powerbi_frame.png", full_page=True)
             browser.close()
-            raise RuntimeError("Power BI iframe not found")
+            raise RuntimeError("Iframe exists, but no PowerBI frame URL matched. Saved debug_no_powerbi_frame.png")
 
         powerbi_frame.wait_for_selector(".pivotTableCellNoWrap", timeout=90000)
 
-        # 1) click Date twice (unstick)
+        # 1) click Date twice
         date_header = powerbi_frame.get_by_role("columnheader", name="Date")
         date_header.click()
         powerbi_frame.wait_for_timeout(WAIT_AFTER_SORT_MS)
